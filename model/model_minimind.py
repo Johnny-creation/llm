@@ -28,6 +28,7 @@ class MiniMindConfig(PretrainedConfig):
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
         self.rope_theta = kwargs.get("rope_theta", 1e6)
         self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
+        self.norm_type = kwargs.get("norm_type", "rmsnorm")  # 新增：归一化类型
         self.rope_scaling = {
             "beta_fast": 32,
             "beta_slow": 1,
@@ -57,6 +58,16 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         return (self.weight * self.norm(x.float())).type_as(x)
+
+class LayerNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        return F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
@@ -99,8 +110,9 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        NormClass = RMSNorm if config.norm_type == "rmsnorm" else LayerNorm
+        self.q_norm = NormClass(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = NormClass(self.head_dim, eps=config.rms_norm_eps)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
@@ -177,8 +189,9 @@ class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.self_attn = Attention(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        NormClass = RMSNorm if config.norm_type == "rmsnorm" else LayerNorm
+        self.input_layernorm = NormClass(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = NormClass(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
@@ -199,7 +212,8 @@ class MiniMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        NormClass = RMSNorm if config.norm_type == "rmsnorm" else LayerNorm
+        self.norm = NormClass(config.hidden_size, eps=config.rms_norm_eps)
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
