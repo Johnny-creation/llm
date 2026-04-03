@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
-from model.model_lora import save_lora, apply_lora
+from model.model_lora import save_lora, apply_lora, apply_qlora, apply_dora
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
@@ -97,6 +97,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_qlora", default=0, type=int, choices=[0, 1], help="是否使用QLoRA（0=否/普通LoRA，1=是/4-bit量化）")
+    parser.add_argument("--use_dora", default=0, type=int, choices=[0, 1], help="是否使用DoRA（0=否，1=是/权重分解）")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -123,21 +125,31 @@ if __name__ == "__main__":
         wandb_run_name = f"MiniMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
-    # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
+    # ========== 5. 定义模型、应用LoRA/QLoRA/DoRA、冻结非LoRA参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    apply_lora(model)
+
+    # 应用 LoRA / QLoRA / DoRA
+    if args.use_dora == 1:
+        apply_dora(model, rank=16)
+        Logger("[DoRA] 使用 DoRA (权重分解)")
+    elif args.use_qlora == 1:
+        apply_qlora(model, rank=16, blocksize=64, double_quant=True, compute_dtype=torch.bfloat16)
+        Logger("[QLoRA] 使用 4-bit QLoRA")
+    else:
+        apply_lora(model)
+        Logger("[LoRA] 使用标准 LoRA")
     
     # 统计参数
     total_params = sum(p.numel() for p in model.parameters())
-    lora_params_count = sum(p.numel() for name, p in model.named_parameters() if 'lora' in name)
+    adapter_params_count = sum(p.numel() for name, p in model.named_parameters() if 'lora' in name or 'dora' in name)
     Logger(f"LLM 总参数量: {total_params / 1e6:.3f} M")
-    Logger(f"LoRA 参数量: {lora_params_count / 1e6:.3f} M")
-    Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
-    
-    # 冻结非LoRA参数，收集LoRA参数
+    Logger(f"适配器参数量: {adapter_params_count / 1e6:.3f} M")
+    Logger(f"适配器参数占比: {adapter_params_count / total_params * 100:.2f}%")
+
+    # 冻结非适配器参数，收集适配器参数
     lora_params = []
     for name, param in model.named_parameters():
-        if 'lora' in name:
+        if 'lora' in name or 'dora' in name:
             param.requires_grad = True
             lora_params.append(param)
         else:
