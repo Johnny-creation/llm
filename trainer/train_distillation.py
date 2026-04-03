@@ -21,21 +21,27 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 warnings.filterwarnings('ignore')
 
 
-def distillation_loss(student_logits, teacher_logits, temperature=1.0, reduction='batchmean'):
-    with torch.no_grad():
-        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
+def distillation_loss(student_logits, teacher_logits, temperature=1.0, reduction='batchmean', kl_type='reverse'):
+    """
+    kl_type: 'forward' = KL(student || teacher), 'reverse' = KL(teacher || student)
+    """
+    if kl_type == 'reverse':
+        # Reverse KL: KL(teacher || student) - 让student覆盖teacher的高概率区域
+        with torch.no_grad():
+            teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+        kl = F.kl_div(student_log_probs, teacher_probs, reduction=reduction)
+    else:
+        # Forward KL: KL(student || teacher) - 让student避免teacher的低概率区域
+        with torch.no_grad():
+            teacher_log_probs = F.log_softmax(teacher_logits / temperature, dim=-1).detach()
+        student_probs = F.softmax(student_logits / temperature, dim=-1)
+        kl = F.kl_div(teacher_log_probs, student_probs, reduction=reduction)
 
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-
-    kl = F.kl_div(
-        student_log_probs,
-        teacher_probs,
-        reduction=reduction
-    )
     return (temperature ** 2) * kl
 
 
-def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_step=0, wandb=None, alpha=0.0, temperature=1.0):
+def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_step=0, wandb=None, alpha=0.0, temperature=1.0, kl_type='reverse'):
     start_time = time.time()
     last_step = start_step
     
@@ -83,7 +89,8 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             distill_loss = distillation_loss(
                 student_logits.view(-1, student_logits.size(-1))[loss_mask_flat == 1],
                 teacher_logits.view(-1, teacher_logits.size(-1))[loss_mask_flat == 1],
-                temperature=temperature
+                temperature=temperature,
+                kl_type=kl_type
             )
         else:
             distill_loss = torch.tensor(0.0, device=args.device)
@@ -170,6 +177,7 @@ if __name__ == "__main__":
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument('--alpha', default=0.5, type=float, help="CE损失权重，总损失=alpha*CE+(1-alpha)*KL")
     parser.add_argument('--temperature', default=1.5, type=float, help="蒸馏温度（推荐范围1.0-2.0）")
+    parser.add_argument('--kl_type', default='reverse', type=str, choices=['forward', 'reverse'], help="KL散度类型：reverse=KL(T||S)，forward=KL(S||T)")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Distillation", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
@@ -236,11 +244,11 @@ if __name__ == "__main__":
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-        if skip > 0: 
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, teacher_model, lm_config_student, start_step, wandb, args.alpha, args.temperature)
+            train_epoch(epoch, loader, len(loader) + skip, teacher_model, lm_config_student, start_step, wandb, args.alpha, args.temperature, args.kl_type)
         else:
-            train_epoch(epoch, loader, len(loader), teacher_model, lm_config_student, 0, wandb, args.alpha, args.temperature)
+            train_epoch(epoch, loader, len(loader), teacher_model, lm_config_student, 0, wandb, args.alpha, args.temperature, args.kl_type)
     
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()
